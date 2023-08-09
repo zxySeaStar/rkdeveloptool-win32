@@ -9,3 +9,8 @@ config.status
 configure
 rkdeveloptool
 rkdeveloptool*bz2
+*.exe
+.vscode/
+log/
+FlashBoot
+FlashData

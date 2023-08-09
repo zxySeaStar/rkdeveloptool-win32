@@ -63,7 +63,9 @@ void usage()
 	printf("ReadChipInfo:\t\trci\r\n");
 	printf("ReadCapability:\t\trcb\r\n");
 	printf("PackBootLoader:\t\tpack\r\n");
-	printf("UnpackBootLoader:\tunpack <boot loader>\r\n");
+	printf("UnpackBootLoader:\t\tunpack <boot loader>\r\n");
+	printf("UnpackRKFW:\t\tunpackRkfw <rkfw>\r\n");
+	printf("WriteRKFW:\t\twriteRkfw <rkfw>\r\n");
 	printf("TagSPL:\t\t\ttagspl <tag> <U-Boot SPL>\r\n");
 	printf("-------------------------------------------------------\r\n\r\n");
 }
@@ -3043,6 +3045,518 @@ void list_device(CRKScan *pScan)
 
 }
 
+#include "rkafp.h"
+#include "rkcrc.h"
+#define UNUSED(x) (void)(x)
+#define ZDebug(x) printf("")
+struct PackageInfo
+{
+	PackageInfo()
+	{
+
+	}
+	PackageInfo(std::string _name, uint32_t _offset, uint32_t _size)
+	{
+		name = _name;
+		fileOffset = _offset;
+		fileSize = _size;
+	}
+	std::string name;
+	uint32_t fileOffset{0};
+	uint32_t fileSize{0};
+};
+
+unsigned int filestream_crc(FILE *fs, size_t stream_len)
+{
+	char buffer[1024];
+	unsigned int crc = 0;
+
+	while (stream_len)
+	{
+		int read_len = stream_len < sizeof(buffer) ? stream_len : sizeof(buffer);
+		read_len = fread(buffer, 1, read_len, fs);
+		if (!read_len)
+			break;
+
+		RKCRC(crc, buffer, read_len);
+		stream_len -= read_len;
+	}
+
+	return crc;
+}
+
+int unpackRKAF(string _rkfwBoot, std::vector<PackageInfo> &_infoList, uint32_t _offset = 0)
+{
+	FILE *fp = NULL;
+	struct update_header header;
+	unsigned int crc = 0;
+
+	fp = fopen(_rkfwBoot.c_str(), "rb");
+	if (!fp) {
+		fprintf(stderr, "can't open file \"%s\": %s\n", _rkfwBoot.c_str(),
+				strerror(errno));
+		goto unpack_fail;
+	}
+
+	fseek(fp, _offset, SEEK_SET);
+	if (sizeof(header) != fread(&header, 1, sizeof(header), fp)) {
+		fprintf(stderr, "Can't read image header\n");
+		goto unpack_fail;
+	}
+
+	if (strncmp(header.magic, RKAFP_MAGIC, sizeof(header.magic)) != 0) {
+		fprintf(stderr, "Invalid header magic\n");
+		goto unpack_fail;
+	}
+
+	fseek(fp, _offset + header.length, SEEK_SET);
+	if (sizeof(crc) != fread(&crc, 1, sizeof(crc), fp))
+	{
+		fprintf(stderr, "Can't read crc checksum\n");
+		goto unpack_fail;
+	}
+
+	printf("Check file:%d...", _offset);
+	fflush(stdout);
+	fseek(fp, _offset, SEEK_SET);
+	if (crc != filestream_crc(fp, header.length)) {
+		printf("Fail\n");
+		goto unpack_fail;
+	}
+	printf("OK\n");
+
+	//printf("------- UNPACK -------\n");
+	if (header.num_parts) {
+		unsigned i;
+		//char dir[PATH_MAX];
+
+		for (i = 0; i < header.num_parts; i++) {
+			struct update_part *part = &header.parts[i];
+			//printf("%s\t0x%08X\t0x%08X\n", part->filename, part->pos + _offset,part->size);
+
+			if (strcmp(part->filename, "SELF") == 0) {
+				printf("Skip SELF file.\n");
+				continue;
+			}
+
+			// parameter 多出文件头8个字节,文件尾4个字节
+			if (memcmp(part->name, "parameter", 9) == 0) {
+				part->pos += 8;
+				part->size -= 12;
+			}
+
+			//snprintf(dir, sizeof(dir), "%s/%s", _dst.c_str(), part->filename);
+
+			// if (-1 == create_dir(dir))
+			// 	continue;
+
+			if (part->pos + part->size > header.length) {
+				fprintf(stderr, "Invalid part: %s\n", part->name);
+				continue;
+			}
+
+			_infoList.push_back(PackageInfo(part->filename,part->pos + _offset,part->size));
+
+			//extract_file(fp, part->pos, part->size, dir);
+		}
+	}
+
+	fclose(fp);
+
+	return 0;
+unpack_fail:
+	if (fp) {
+		fclose(fp);
+	}
+
+	return -1;
+}
+
+bool unpackRKFW(string _rkfwBoot, std::vector<PackageInfo> &_packageInfoList)
+{
+	CRKImage *pImage = NULL;
+	bool bRet;
+	pImage = new CRKImage(_rkfwBoot, bRet);
+
+	if (!bRet){
+		ERROR_COLOR_ATTR;
+		printf("Opening loader failed, exiting upgrade loader!");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		goto Exit_UnpackRkfw;
+	} else {
+		//printf("BOOT:0x%08X 0x%08X\r\n",pImage->GetBootOffset(),(uint32_t)pImage->GetBootSize());
+		//printf("FW:0x%08X 0x%08X\r\n",pImage->GetFWOffset(),(uint32_t)pImage->GetFWSize());
+		_packageInfoList.push_back(PackageInfo("loader",pImage->GetBootOffset(),pImage->GetBootSize()));
+		_packageInfoList.push_back(PackageInfo("rkaf",pImage->GetFWOffset(),pImage->GetFWSize()));
+	}
+
+	// parse RKAF
+	if(0 != unpackRKAF(_rkfwBoot, _packageInfoList, pImage->GetFWOffset()))
+	{
+		ERROR_COLOR_ATTR;
+		printf("unpack RKAF failed, exiting !");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		goto Exit_UnpackRkfw;
+	}
+
+	// print all the component
+	delete pImage;
+	return true;
+
+Exit_UnpackRkfw:
+	if (pImage)
+		delete pImage;
+	return false;
+}
+
+bool write_lba_rkfw(STRUCT_RKDEVICE_DESC &dev, UINT uiBegin, char *szFile, PackageInfo _packageInfo)
+{
+	if (!check_device_type(dev, RKUSB_LOADER | RKUSB_MASKROM))
+		return false;
+	CRKUsbComm *pComm = NULL;
+	FILE *file = NULL;
+	bool bRet, bFirst = true, bSuccess = false;
+	int iRet;
+	long long iTotalWrite = 0, iFileSize = 0;
+	UINT iWrite = 0, iRead = 0;
+	UINT uiLen;
+	BYTE pBuf[N_SECTORS];
+
+	pComm =  new CRKUsbComm(dev, g_pLogObject, bRet);
+	if (bRet) {
+		file = fopen(szFile, "rb");
+		if( !file ) {
+			printf("Write LBA failed, err=%d, can't open file: %s\r\n", errno, szFile);
+			goto Exit_WriteLBA;
+		}
+
+		iRet = fseeko(file, 0, SEEK_END);
+		iFileSize = ftello(file);
+		if(_packageInfo.fileSize + _packageInfo.fileOffset > iFileSize)
+		{
+			printf("Write LBA failed, fileSize is not correct\r\n");
+			goto Exit_WriteLBA;
+		}
+		iFileSize = _packageInfo.fileSize;
+		fseeko(file, _packageInfo.fileOffset, SEEK_SET);
+		while(iTotalWrite < iFileSize) {
+			memset(pBuf, 0, N_SECTORS);
+			iWrite = iRead= fread(pBuf, 1, N_SECTORS, file);
+			uiLen = ((iWrite % 512) == 0) ? (iWrite / 512) : (iWrite / 512 + 1);
+			iRet = pComm->RKU_WriteLBA( uiBegin, uiLen, pBuf);
+			if(ERR_SUCCESS == iRet) {
+				uiBegin += uiLen;
+				iTotalWrite += iWrite;
+				if (bFirst) {
+					if (iTotalWrite >= 1024)
+						printf("Write LBA from file (%lld%%)\r\n", (iTotalWrite / 1024) * 100 / (iFileSize / 1024));
+					else
+						printf("Write LBA from file (%lld%%)\r\n", iTotalWrite * 100 / iFileSize);
+					bFirst = false;
+				} else {
+					CURSOR_MOVEUP_LINE(1);
+					CURSOR_DEL_LINE;
+					printf("Write LBA from file (%lld%%)\r\n", (iTotalWrite / 1024) * 100 / (iFileSize / 1024));
+				}
+			} else {
+				if (g_pLogObject)
+					g_pLogObject->Record("Error: RKU_WriteLBA failed, err=%d", iRet);
+
+				printf("Write LBA failed!\r\n");
+				goto Exit_WriteLBA;
+			}
+		}
+		bSuccess = true;
+	} else {
+		printf("Write LBA quit, creating comm object failed!\r\n");
+	}
+Exit_WriteLBA:
+	if (pComm) {
+		delete pComm;
+		pComm = NULL;
+	}
+	if (file)
+		fclose(file);
+	return bSuccess;
+}
+
+bool parse_parameter_file_RKFW(char *pParamFile, PARAM_ITEM_VECTOR &vecItem, CONFIG_ITEM_VECTOR &vecUuidItem, PackageInfo _packageInfo)
+{
+	FILE *file = NULL;
+	file = fopen(pParamFile, "rb");
+	if( !file ) {
+		if (g_pLogObject)
+			g_pLogObject->Record("%s failed, err=%d, can't open file: %s\r\n", __func__, errno, pParamFile);
+		return false;
+	}
+	long long iFileSize;
+	fseek(file, 0, SEEK_END);
+	iFileSize = ftell(file);
+	if( _packageInfo.fileOffset + _packageInfo.fileSize > iFileSize)
+	{
+		fclose(file);
+		return false;
+	}
+	iFileSize = _packageInfo.fileSize;
+	fseek(file, _packageInfo.fileOffset, SEEK_SET);
+	char *pParamBuf = NULL;
+	pParamBuf = new char[iFileSize];
+	if (!pParamBuf) {
+		fclose(file);
+		return false;
+	}
+	int iRead;
+	iRead = fread(pParamBuf, 1, iFileSize, file);
+	if (iRead != iFileSize) {
+		if (g_pLogObject)
+			g_pLogObject->Record("%s failed, err=%d, read=%d, total=%d\r\n", __func__, errno,iRead,iFileSize);
+		fclose(file);
+		delete []pParamBuf;
+		return false;
+	}
+	fclose(file);
+	bool bRet;
+	bRet = parse_parameter(pParamBuf, vecItem, vecUuidItem);
+	delete []pParamBuf;
+	return bRet;
+}
+
+bool write_gpt_RKFW(STRUCT_RKDEVICE_DESC &dev, char *szParameter, PackageInfo _packageInfo)
+{
+	u8 flash_info[SECTOR_SIZE], master_gpt[34 * SECTOR_SIZE], backup_gpt[33 * SECTOR_SIZE];
+	u32 total_size_sector;
+	CRKComm *pComm = NULL;
+	PARAM_ITEM_VECTOR vecItems;
+	CONFIG_ITEM_VECTOR vecUuid;
+	int iRet;
+	bool bRet, bSuccess = false;
+	if (!check_device_type(dev, RKUSB_MASKROM | RKUSB_LOADER))
+		return false;
+
+	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
+	if (!bRet) {
+		ERROR_COLOR_ATTR;
+		printf("Creating Comm Object failed!");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		goto Exit_Write_gpt_RKFW;
+	}
+	printf("Writing gpt...\r\n");
+	//1.get flash info
+	iRet = pComm->RKU_ReadFlashInfo(flash_info);
+	if (iRet != ERR_SUCCESS) {
+		ERROR_COLOR_ATTR;
+		printf("Reading Flash Info failed!");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		goto Exit_Write_gpt_RKFW;
+	}
+	total_size_sector = *(u32 *)flash_info;
+	
+	//2.get partition from parameter
+	bRet = parse_parameter_file_RKFW(szParameter, vecItems, vecUuid, _packageInfo);
+	if (!bRet) {
+		ERROR_COLOR_ATTR;
+		printf("Parsing parameter failed!");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		goto Exit_Write_gpt_RKFW;
+	}
+	//3.generate gpt info
+	create_gpt_buffer(master_gpt, vecItems, vecUuid, total_size_sector);
+	memcpy(backup_gpt, master_gpt + 2* SECTOR_SIZE, 32 * SECTOR_SIZE);
+	memcpy(backup_gpt + 32 * SECTOR_SIZE, master_gpt + SECTOR_SIZE, SECTOR_SIZE);
+	prepare_gpt_backup(master_gpt, backup_gpt);
+
+
+	//4. write gpt
+	iRet = pComm->RKU_WriteLBA(0, 34, master_gpt);
+	if (iRet != ERR_SUCCESS) {
+		ERROR_COLOR_ATTR;
+		printf("Writing master gpt failed!");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		goto Exit_Write_gpt_RKFW;
+	}
+	iRet = pComm->RKU_WriteLBA(total_size_sector - 33, 33, backup_gpt);
+	if (iRet != ERR_SUCCESS) {
+		ERROR_COLOR_ATTR;
+		printf("Writing backup gpt failed!");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		goto Exit_Write_gpt_RKFW;
+	}
+
+	bSuccess = true;
+	CURSOR_MOVEUP_LINE(1);
+	CURSOR_DEL_LINE;
+	printf("Writing gpt succeeded.\r\n");
+
+Exit_Write_gpt_RKFW:
+	if (pComm)
+		delete pComm;
+	return bSuccess;
+}
+
+bool writeRKFWPart(STRUCT_RKDEVICE_DESC &dev, string _rkfwBoot, PackageInfo info, uint32_t _startLda)
+{
+	UNUSED(dev);
+	UNUSED(_rkfwBoot);
+	printf("writeRKFWPart: file_name: %s,\tstart_lda: 0x%08X\r\n",info.name.c_str(),_startLda);
+
+	// get the gpt info
+	bool bret = write_lba_rkfw(dev, _startLda, (char*)_rkfwBoot.c_str(), info);
+	return bret;
+}
+
+
+bool writeRKFW(STRUCT_RKDEVICE_DESC &dev, string _rkfwBoot,  const std::vector<PackageInfo> &_packageInfoList)
+{
+	UNUSED(_rkfwBoot);
+	UNUSED(_packageInfoList);
+	bool isSuccess = false;
+	PackageInfo info;
+	std::vector<PackageInfo> gptInfoList;
+	auto funcFindPackage = [](const std::vector<PackageInfo> &_packageInfoList, PackageInfo& _info, std::string _name) -> bool
+	{
+		for(auto item: _packageInfoList)
+		{
+			if(item.name.find(_name)!=std::string::npos)
+			{
+				_info = item;
+				return true;
+			}
+		}
+		return false;
+	};
+	// check different mode
+	// maskrom mode：
+	if (check_device_type(dev, RKUSB_MASKROM))
+	{
+		printf("RKUSB_MASKROM\r\n");
+		if(!test_device(dev))
+		{
+			// mode 1
+			// need downloaded: ddr, usbplug from loader
+			printf("step 1\r\n");
+			isSuccess = download_boot(dev, (char*)_rkfwBoot.c_str());
+		}
+		else
+		{
+			// mode 2
+			// need download gadget. need downloaded: loader, parameter.txt, trust.bin, uboot.bin, boot.img, rootfs.img, recovery.img, oem.img, userdata.img, misc.img
+			printf("step 2\r\n");
+
+			// upgrade loader
+			if(!upgrade_loader(dev, (char*)_rkfwBoot.c_str()))
+			{
+				return false;
+			}
+
+			// parse parameter.txt
+			PARAM_ITEM_VECTOR vecItems;
+			CONFIG_ITEM_VECTOR vecUuid;
+			if(!funcFindPackage(_packageInfoList, info, "Image/parameter.txt"))
+			{
+				return false;
+			}
+			if(!parse_parameter_file_RKFW((char*)_rkfwBoot.c_str(), vecItems, vecUuid, info))
+			{
+				return  false;
+			}
+			for(auto item: vecItems)
+			{
+				//printf("%s : 0x%08X\r\n", item.szItemName, item.uiItemOffset);
+				std::string partName = item.szItemName;
+				uint32_t startLda = item.uiItemOffset;
+				if(partName == "userdata:grow")
+				{
+					partName = "userdata";
+				}
+				if(!funcFindPackage(_packageInfoList, info, "Image/" + partName + ".img"))
+				{
+					continue;
+				}
+				if(!writeRKFWPart(dev, (char*)_rkfwBoot.c_str(), info, startLda))
+				{
+					return false;
+				}
+			}
+
+			// write parameter.txt
+			if(!funcFindPackage(_packageInfoList, info, "Image/parameter.txt"))
+			{
+				return false;
+			}
+			if(!write_gpt_RKFW(dev, (char*)_rkfwBoot.c_str(), info))
+			{
+				return false;
+			}
+			if(!reset_device(dev))
+			{
+				return false;
+			}
+			isSuccess = true;
+		}
+		return isSuccess;
+	}
+
+	// loader mode: 
+	// need downloaded: boot.img, rootfs.img, recovery.img, oem.img, userdata.img, misc.img
+	// get the lba address of module name, write lba 
+	if(check_device_type(dev, RKUSB_LOADER))
+	{
+		printf("RKUSB_LOADER\r\n");
+
+		// parse parameter.txt
+		PARAM_ITEM_VECTOR vecItems;
+		CONFIG_ITEM_VECTOR vecUuid;
+		if(!funcFindPackage(_packageInfoList, info, "Image/parameter.txt"))
+		{
+			return false;
+		}
+		if(!parse_parameter_file_RKFW((char*)_rkfwBoot.c_str(), vecItems, vecUuid, info))
+		{
+			return  false;
+		}
+		for(auto item: vecItems)
+		{
+			//printf("%s : 0x%08X\r\n", item.szItemName, item.uiItemOffset);
+			std::string partName = item.szItemName;
+			uint32_t startLda = item.uiItemOffset;
+			if(partName == "userdata:grow")
+			{
+				partName = "userdata";
+			}
+			if(!funcFindPackage(_packageInfoList, info, "Image/" + partName + ".img"))
+			{
+				continue;
+			}
+			if(!writeRKFWPart(dev, (char*)_rkfwBoot.c_str(), info, startLda))
+			{
+				return false;
+			}
+		}
+		// write parameter.txt
+		if(!funcFindPackage(_packageInfoList, info, "Image/parameter.txt"))
+		{
+			return false;
+		}
+		if(!write_gpt_RKFW(dev, (char*)_rkfwBoot.c_str(), info))
+		{
+			return false;
+		}
+		if(!reset_device(dev))
+		{
+			return false;
+		}
+		isSuccess = true;
+	}
+
+	return isSuccess;
+}
 
 bool handle_command(int argc, char* argv[], CRKScan *pScan)
 {
@@ -3074,6 +3588,19 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 	} else if (strcmp(strCmd.c_str(), "UNPACK") == 0) {//unpack boot loader
 		string strLoader = argv[2];
 		unpackBoot((char*)strLoader.c_str());
+		return true;
+	} else if(strcmp(strCmd.c_str(), "UNPACKRKFW") == 0){
+		string strRkfw = argv[2];
+		std::vector<PackageInfo> packageInfoList;
+		if(!unpackRKFW(strRkfw, packageInfoList))
+		{
+			return false;
+		}
+
+		for(auto item : packageInfoList)
+		{
+			printf("fileName:%s\toffset:0x%08X\tsize:0x%08X\r\n", item.name.c_str(), item.fileOffset, item.fileSize);
+		}
 		return true;
 	} else if (strcmp(strCmd.c_str(), "TAGSPL") == 0) {//tag u-boot spl
 		if (argc == 4) {
@@ -3256,6 +3783,26 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 
 		} else
 			printf("Parameter of [WLX] command is invalid, please check help!\r\n");
+	} else if (strcmp(strCmd.c_str(), "WRITERKFW") == 0) {
+		string strRkfw;
+		if (argc > 2) {
+			strRkfw = argv[2];
+		}
+		std::vector<PackageInfo> packageInfoList;
+		if(!unpackRKFW(strRkfw, packageInfoList))
+		{
+			return false;
+		}
+
+		for(auto item : packageInfoList)
+		{
+			printf("fileName:%s\toffset:0x%08X\tsize:0x%08X\r\n", item.name.c_str(), item.fileOffset, item.fileSize);
+		}
+		fflush(stdout);
+		auto isSuccess = writeRKFW(dev, strRkfw, packageInfoList);
+		printf("WRITERKFW result:%d\r\n", isSuccess);
+		fflush(stdout);
+		return true;
 	} else if (strcmp(strCmd.c_str(), "RL") == 0) {//Read LBA
 		char *pszEnd;
 		UINT uiBegin, uiLen;
@@ -3303,13 +3850,20 @@ int main(int argc, char* argv[])
 
 	strLogDir =  "./log/";
 	strConfigFile += "./config.ini";
+
+	bool useLog = false;
+
+	if(useLog)
+	{
 	if (opendir(strLogDir.c_str()) == NULL)
 #if defined(_WIN32) || defined(WIN32)
         mkdir(strLogDir.c_str());
 #else
         mkdir(strLogDir.c_str(), S_IRWXU | S_IRWXG | S_IROTH);
 #endif
-	g_pLogObject = new CRKLog(strLogDir.c_str(), "log",true);
+	}
+
+	g_pLogObject = new CRKLog(strLogDir.c_str(), "log", useLog);
 
 	if(stat(strConfigFile.c_str(), &statBuf) < 0) {
 		if (g_pLogObject) {
